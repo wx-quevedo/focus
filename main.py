@@ -23,6 +23,7 @@ from capture.camera import DEFAULT_EXPOSURE, DEFAULT_FOCUS, Camera
 from gaze.eth_xgaze import EthXGazeEstimator
 from gaze.mediapipe_head import HeadTracker
 from mapping.calibrator import (GazeMapper, make_features, run_calibration)
+from mapping.pursuit import DEFAULT_SPEED_PX_S, SERPENTINE_PASSES
 from mapping.smoother import PointSmoother
 from overlay import screen as screen_cfg
 from overlay.dot import DotOverlay, get_screen_size
@@ -62,6 +63,23 @@ class GazePipeline:
                                        self.tracker.camera_matrix(w, h))
         return obs, gaze
 
+    def read_state(self):
+        """One frame with an explicit status for robustness:
+        ('no_frame', None, None) on a failed grab (camera gone),
+        ('no_face', None, None) when no face is detected,
+        ('ok', obs, gaze) otherwise. Lets the overlay worker tell a camera
+        disconnect apart from the user simply looking away."""
+        frame = self.camera.read()
+        if frame is None:
+            return "no_frame", None, None
+        obs = self.tracker.process(frame)
+        if obs is None:
+            return "no_face", None, None
+        h, w = frame.shape[:2]
+        gaze = self.estimator.estimate(frame, obs,
+                                       self.tracker.camera_matrix(w, h))
+        return "ok", obs, gaze
+
     def features(self):
         """One frame -> layer-2 feature vector, or None if no face."""
         result = self.sample()
@@ -69,7 +87,27 @@ class GazePipeline:
             return None
         obs, gaze = result
         return make_features(gaze.yaw_deg, gaze.pitch_deg, obs.head_yaw,
-                             obs.head_pitch, obs.face_center)
+                             obs.head_pitch)
+
+    def features_ts(self):
+        """(features | None, grab_time) for latency-sensitive sampling.
+
+        grab_time is stamped at the camera grab, BEFORE MediaPipe/CNN, so
+        smooth-pursuit lag reflects physiological + display latency and not
+        this pipeline's own processing time.
+        """
+        frame = self.camera.read()
+        grab_t = self.camera.last_grab_time
+        if frame is None:
+            return None, grab_t
+        obs = self.tracker.process(frame)
+        if obs is None:
+            return None, grab_t
+        h, w = frame.shape[:2]
+        gaze = self.estimator.estimate(frame, obs,
+                                       self.tracker.camera_matrix(w, h))
+        return make_features(gaze.yaw_deg, gaze.pitch_deg, obs.head_yaw,
+                             obs.head_pitch), grab_t
 
     def close(self) -> None:
         self.camera.release()
@@ -150,6 +188,39 @@ def _resolve_geometry(args: argparse.Namespace,
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
     geo = _resolve_geometry(args, persist=True)
+    if args.pursuit:
+        # PHASE-01B (c)/(d): combined session. Discrete grid FIRST (fresh,
+        # high-quality anchors), then smooth pursuit (dense coverage), then
+        # a degree/alpha model chosen by block-CV. --pursuit-csv reuses a
+        # prior pursuit stream instead of recollecting it.
+        from mapping.calibrator import collect_grid, fit_combined
+        from mapping.pursuit import load_pursuit_result, run_pursuit
+        screen = (geo.width_px, geo.height_px)
+        with GazePipeline(args) as pipeline:
+            print("=== combined calibration: discrete grid, then pursuit ===")
+            grid = collect_grid(pipeline.features, screen)
+            if grid is None:
+                return 1
+            if args.pursuit_csv:
+                pursuit = load_pursuit_result(
+                    Path(args.pursuit_csv), screen_size=screen,
+                    px_per_cm=geo.px_per_cm, distance_cm=geo.distance_cm)
+            else:
+                pursuit = run_pursuit(
+                    sample_provider=pipeline.features_ts, screen_size=screen,
+                    px_per_cm=geo.px_per_cm, distance_cm=geo.distance_cm,
+                    output_dir=DATA_DIR, speed_px_s=args.pursuit_speed,
+                    passes=args.pursuit_passes, report=False)
+            if pursuit is None:
+                return 1
+        result = fit_combined(
+            grid, pursuit.features, pursuit.targets_px, pursuit.weights,
+            screen, Path(args.calibration),
+            pursuit_meta={"best_lag_ms": pursuit.best_lag_ms,
+                          "discard": pursuit.discard.as_dict()},
+            screen_width_cm=geo.width_cm, screen_height_cm=geo.height_cm,
+            distance_cm=geo.distance_cm)
+        return 0 if result is not None else 1
     with GazePipeline(args) as pipeline:
         result = run_calibration(
             sample_provider=pipeline.features,
@@ -199,7 +270,29 @@ def cmd_demo(args: argparse.Namespace) -> int:
                 return 0
 
 
+def cmd_record_background(args: argparse.Namespace) -> int:
+    """PHASE-02B: overlay (optional) + behavior logging to SQLite, in the
+    tray. All local; keyboard/mouse are per-interval COUNTS only."""
+    from overlay.config import resolve as resolve_overlay
+    from overlay.gaze_overlay import OverlayApp
+
+    mapper = GazeMapper.load(Path(args.calibration))
+    _trace_calibration(Path(args.calibration))
+    screen = get_screen_size()
+    print(f"screen: {screen[0]}x{screen[1]} px (detected)")
+    cfg = resolve_overlay({})   # overlay.yaml or defaults; no per-run overrides
+    db_path = Path(args.db) if args.db else (DATA_DIR / "activity.db")
+    app = OverlayApp(
+        pipeline_factory=lambda: GazePipeline(args),
+        mapper=mapper, screen_size=screen, config=cfg,
+        use_tray=not args.no_tray, enable_logging=True, db_path=db_path,
+        no_titles=args.no_titles, start_hidden=args.hide_overlay)
+    return app.run(exit_after=args.exit_after)
+
+
 def cmd_record(args: argparse.Namespace) -> int:
+    if getattr(args, "background", False):
+        return cmd_record_background(args)
     import cv2
 
     mapper = GazeMapper.load(Path(args.calibration))
@@ -232,8 +325,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             if result is not None:
                 obs, gaze = result
                 features = make_features(gaze.yaw_deg, gaze.pitch_deg,
-                                         obs.head_yaw, obs.head_pitch,
-                                         obs.face_center)
+                                         obs.head_yaw, obs.head_pitch)
                 raw_x, raw_y = mapper.predict(features)
                 raw_x = _clamp(raw_x, screen[0])
                 raw_y = _clamp(raw_y, screen[1])
@@ -263,6 +355,42 @@ def cmd_record(args: argparse.Namespace) -> int:
     cv2.destroyWindow(window)
     print(f"saved {rows} samples to {out_path}")
     return 0
+
+
+def _parse_color(text: str) -> tuple:
+    """'r,g,b' (0-255) -> tuple; falls back to neutral off-white."""
+    try:
+        parts = tuple(int(v) for v in text.split(","))
+        if len(parts) == 3 and all(0 <= v <= 255 for v in parts):
+            return parts
+    except ValueError:
+        pass
+    print(f"WARNING: could not parse --dot-color '{text}'; using default.")
+    return (235, 235, 228)
+
+
+def cmd_overlay(args: argparse.Namespace) -> int:
+    from overlay.config import resolve as resolve_overlay
+    from overlay.gaze_overlay import OverlayApp
+
+    mapper = GazeMapper.load(Path(args.calibration))
+    _trace_calibration(Path(args.calibration))
+    screen = get_screen_size()
+    print(f"screen: {screen[0]}x{screen[1]} px (detected)")
+
+    # Precedence flag > overlay.yaml > default; None means the flag was absent.
+    color = _parse_color(args.dot_color) if args.dot_color else None
+    cfg = resolve_overlay({
+        "dot_size": args.dot_size, "dot_opacity": args.dot_opacity,
+        "dot_color": color, "deadzone": args.deadzone,
+        "min_cutoff": args.min_cutoff, "beta": args.beta,
+        "pose_margin": args.pose_margin,
+        "offscreen_margin": args.offscreen_margin, "fade_ms": args.fade_ms})
+    app = OverlayApp(
+        pipeline_factory=lambda: GazePipeline(args),
+        mapper=mapper, screen_size=screen, config=cfg,
+        use_tray=not args.no_tray)
+    return app.run(exit_after=args.exit_after)
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
@@ -349,15 +477,75 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("calibrate",
                        help="run the 33-target calibration routine")
     common(p); geometry(p)
+    p.add_argument("--pursuit", action="store_true",
+                   help="combined calibration: discrete grid + smooth "
+                        "pursuit, degree/alpha chosen by block-CV")
+    p.add_argument("--pursuit-csv", default=None,
+                   help="reuse a saved pursuit stream (data/pursuit_*.csv) "
+                        "instead of recollecting it")
+    p.add_argument("--pursuit-speed", type=float, default=DEFAULT_SPEED_PX_S,
+                   help="pursuit ball speed in px/s "
+                        f"(default: {DEFAULT_SPEED_PX_S:.0f}; ~8-9 deg/s on "
+                        "the reference rig, deliberately slow)")
+    p.add_argument("--pursuit-passes", type=int, default=SERPENTINE_PASSES,
+                   help="serpentine horizontal passes "
+                        f"(default: {SERPENTINE_PASSES})")
     p.set_defaults(func=cmd_calibrate)
 
     p = sub.add_parser("demo", help="live gaze dot (requires calibration)")
     common(p); smoothing(p)
     p.set_defaults(func=cmd_demo)
 
+    p = sub.add_parser("overlay",
+                       help="transparent click-through gaze overlay over "
+                            "your real apps (Tobii-style)")
+    common(p)
+    # All tunables default None so precedence is flag > data/overlay.yaml >
+    # built-in default (resolved in overlay.config). They are also editable
+    # live from the settings panel (Ctrl+Alt+S).
+    p.add_argument("--dot-size", type=int, default=None,
+                   help="ring outer diameter in px (default: 40)")
+    p.add_argument("--dot-opacity", type=float, default=None,
+                   help="peak ring opacity 0-1 (default: 0.85)")
+    p.add_argument("--dot-color", default=None,
+                   help="ring color as r,g,b 0-255 (default neutral)")
+    p.add_argument("--deadzone", type=float, default=None,
+                   help="cursor holds still under this px move (default: 12)")
+    p.add_argument("--min-cutoff", type=float, default=None,
+                   help="One-Euro min cutoff Hz (default: 1.0)")
+    p.add_argument("--beta", type=float, default=None,
+                   help="One-Euro speed coefficient (default: 0.007)")
+    p.add_argument("--pose-margin", type=float, default=None,
+                   help="degrees beyond the calibrated head-pose range "
+                        "before the cursor fades (default: 5)")
+    p.add_argument("--offscreen-margin", type=float, default=None,
+                   help="fade when the prediction is this fraction of screen "
+                        "width outside the screen (default: 0.10)")
+    p.add_argument("--fade-ms", type=int, default=None,
+                   help="fade in/out duration in ms (default: 250)")
+    p.add_argument("--no-tray", action="store_true",
+                   help="do not create a system-tray icon")
+    p.add_argument("--exit-after", type=float, default=None,
+                   help="auto-quit after N seconds (measurement/testing)")
+    p.set_defaults(func=cmd_overlay)
+
     p = sub.add_parser("record",
-                       help="record a gaze session to CSV with timestamps")
+                       help="record a gaze session to CSV, or "
+                            "--background for behavior logging (2B)")
     common(p); smoothing(p)
+    p.add_argument("--background", action="store_true",
+                   help="PHASE-02B: run the overlay + behavior logging to "
+                        "SQLite, in the system tray")
+    p.add_argument("--no-titles", action="store_true",
+                   help="privacy: log the process only, never window titles")
+    p.add_argument("--hide-overlay", action="store_true",
+                   help="run with the gaze cursor hidden (logging still runs)")
+    p.add_argument("--db", default=None,
+                   help="activity DB path (default: data/activity.db)")
+    p.add_argument("--no-tray", action="store_true",
+                   help="run without a system-tray icon")
+    p.add_argument("--exit-after", type=float, default=None,
+                   help="auto-quit after N seconds (measurement/testing)")
     p.set_defaults(func=cmd_record)
 
     p = sub.add_parser("evaluate",

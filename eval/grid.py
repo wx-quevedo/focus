@@ -151,6 +151,77 @@ def _print_evidence_table(measurements: list[EvalMeasurement],
             "frame_off_screen_frac": round(frame_oob, 4)}
 
 
+_REGION_COLS = ("left", "center", "right")
+_REGION_ROWS = ("top", "middle", "bottom")
+# Success criterion (PHASE-01B): no region may exceed this multiple of the
+# median region error. It is how we confirm the right-side degradation is
+# gone after the physical camera re-centering.
+REGION_FLAG_RATIO = 1.5
+
+
+def _region_of(value: float, size: int) -> int:
+    """0/1/2 third index; guards the exact-edge case at value == size."""
+    return min(int(value / (size / 3.0)), 2) if size > 0 else 0
+
+
+def _region_stats(measurements: list[EvalMeasurement], screen_w: int,
+                  screen_h: int) -> tuple[dict, float]:
+    """Mean error over a 3x3 spatial grid (col by x third, row by y third),
+    to localize regional degradation the center/edge/corner zones average
+    away. Returns (stats, median_region_mean_px)."""
+    buckets: dict[tuple[int, int], list[float]] = {}
+    for m in measurements:
+        col = _region_of(m.target.x, screen_w)
+        row = _region_of(m.target.y, screen_h)
+        buckets.setdefault((row, col), []).append(m.error_px)
+
+    stats: dict = {}
+    for (row, col), errs in buckets.items():
+        arr = np.array(errs)
+        stats[f"{_REGION_ROWS[row]}-{_REGION_COLS[col]}"] = {
+            "row": row, "col": col, "targets": len(arr),
+            "mean_px": round(float(arr.mean()), 1),
+            "mean_pct": round(float(arr.mean()) / screen_w * 100, 2),
+        }
+    means = [s["mean_px"] for s in stats.values()]
+    median = float(np.median(means)) if means else 0.0
+    for s in stats.values():
+        s["over_threshold"] = bool(median > 0
+                                   and s["mean_px"] > REGION_FLAG_RATIO * median)
+    return stats, median
+
+
+def _print_region_grid(stats: dict, median: float) -> list[str]:
+    """Print the 3x3 region error grid; return the flagged region names."""
+    by_cell = {(s["row"], s["col"]): (name, s) for name, s in stats.items()}
+    print(f"\nregion error (3x3, mean px / % of width; median "
+          f"{median:.0f} px; [!] > {REGION_FLAG_RATIO:g}x median):")
+    print("  " + f"{'':<7}" + "".join(f"{c:>18}" for c in _REGION_COLS))
+    flagged: list[str] = []
+    for row in range(3):
+        cells = []
+        for col in range(3):
+            hit = by_cell.get((row, col))
+            if hit is None:
+                cells.append(f"{'-':>18}")
+                continue
+            name, s = hit
+            if s["over_threshold"]:
+                flagged.append(name)
+            text = (f"{s['mean_px']:.0f} ({s['mean_pct']:.1f}%)"
+                    + (" [!]" if s["over_threshold"] else ""))
+            cells.append(f"{text:>18}")
+        print("  " + f"{_REGION_ROWS[row]:<7}" + "".join(cells))
+    if flagged:
+        print(f"WARNING: region(s) over {REGION_FLAG_RATIO:g}x the median "
+              f"error: {', '.join(flagged)}. Localized degradation persists "
+              "(check camera centering, side lighting, or extreme-angle "
+              "gaze).")
+    else:
+        print("no region exceeds the threshold: error is spatially even.")
+    return flagged
+
+
 def _print_report(stats: dict, jitter_mean_px: float, jitter_pct: float,
                   skipped: int, have_geo: bool) -> None:
     print()
@@ -288,10 +359,13 @@ def run_evaluation(predict_provider,
         return None
 
     stats = _zone_stats(measurements, screen_w, px_per_cm, distance_cm)
+    region_stats, region_median = _region_stats(measurements, screen_w,
+                                                screen_h)
     jitter_mean = float(np.mean([m.jitter_px for m in measurements]))
     jitter_pct = jitter_mean / screen_w * 100
     oob_stats = _print_evidence_table(measurements, screen_w, screen_h)
     _print_report(stats, jitter_mean, jitter_pct, skipped, have_geo)
+    flagged = _print_region_grid(region_stats, region_median)
 
     report = {
         "created": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -301,6 +375,9 @@ def run_evaluation(predict_provider,
                    "height_cm": screen_height_cm,
                    "distance_cm": distance_cm},
         "zones": stats,
+        "regions": region_stats,
+        "region_median_px": round(region_median, 1),
+        "regions_over_threshold": flagged,
         "jitter_mean_px": round(jitter_mean, 1),
         "jitter_mean_pct": round(jitter_pct, 2),
         "out_of_bounds": oob_stats,

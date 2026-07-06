@@ -161,6 +161,10 @@ class Camera:
         self.disable_auto_exposure = disable_auto_exposure
         self._cap: cv2.VideoCapture | None = None
         self._backend_name = "unknown"
+        # perf_counter timestamp of the most recent grab, set in read() as
+        # close to frame arrival as possible. Latency-sensitive callers
+        # (smooth pursuit) must timestamp here, not after MediaPipe/CNN.
+        self.last_grab_time = 0.0
 
     def _apply_mode(self, cap: cv2.VideoCapture) -> bool:
         """Negotiate MJPG @ WxH @ fps. Returns True if readback confirms."""
@@ -239,6 +243,12 @@ class Camera:
 
         self._cap = cap
         self._backend_name = cap.getBackendName()
+        # Best-effort: keep the driver queue at one frame so read() returns
+        # the latest, not a stale buffered frame. VERIFIED that MSMF ignores
+        # this (set() returns False) and delivers fresh frames anyway, with
+        # no backlog; kept as a harmless no-op that does help the DShow
+        # fallback. Do not rely on it for latency on MSMF.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._apply_controls(cap)
 
         # Discard warm-up frames so exposure settles, then re-assert the
@@ -263,10 +273,15 @@ class Camera:
         return self
 
     def read(self):
-        """Return the next BGR frame, or None if the grab failed."""
+        """Return the next BGR frame, or None if the grab failed.
+
+        Records last_grab_time immediately, so a caller can pair the frame
+        with an event timeline without including its own processing time.
+        """
         if self._cap is None:
             raise RuntimeError("Camera is not open. Call open() first.")
         ok, frame = self._cap.read()
+        self.last_grab_time = time.perf_counter()
         return frame if ok else None
 
     def set_focus(self, value: float) -> int:

@@ -90,6 +90,13 @@ class PointSmoother:
         t = time.perf_counter() if timestamp is None else timestamp
         return self._fx.filter(x, t), self._fy.filter(y, t)
 
+    def set_params(self, min_cutoff: float, beta: float) -> None:
+        """Live-update the filter tuning (used by the settings panel). Only
+        changes the cutoff/beta; the filter state and math are untouched."""
+        for f in (self._fx, self._fy):
+            f.min_cutoff = min_cutoff
+            f.beta = beta
+
     def reset(self) -> None:
         self._fx.reset()
         self._fy.reset()

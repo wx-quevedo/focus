@@ -6,3 +6,7 @@ opencv-contrib-python==4.10.0.84
 numpy==1.26.4
 scikit-learn==1.5.2
 PyYAML==6.0.2
+PyQt6==6.7.1
+pywin32==306
+pynput==1.7.7
+psutil==6.0.0
