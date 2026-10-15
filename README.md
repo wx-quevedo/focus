@@ -111,7 +111,7 @@ You can also test each component on its own: `python -m capture.camera --preview
 
 ## Author
 
-**Washington Quevedo**
+**Washington X. Quevedo**
 
 - LinkedIn: https://www.linkedin.com/in/wxquevedo
 - GitHub: https://github.com/wx-quevedo
